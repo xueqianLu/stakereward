@@ -11,6 +11,10 @@ import (
 	"math/big"
 )
 
+var (
+	nonce uint64 = 0
+)
+
 func (p *PullEvent) Multisend(useraddr string, amount *big.Int) (string, error) {
 	privatek := beego.AppConfig.String("privatekey")
 	privateKey, err := crypto.HexToECDSA(privatek)
@@ -24,10 +28,12 @@ func (p *PullEvent) Multisend(useraddr string, amount *big.Int) (string, error) 
 		logs.Error("get addr from private key failed", "err", err)
 		return "", err
 	}
-	nonce, err := p.client.NonceAt(p.ctx, sender, nil)
-	if err != nil {
-		logs.Error("get user nonce failed", "err", err)
-		return "", err
+	if nonce == 0 {
+		nonce, err = p.client.NonceAt(p.ctx, sender, nil)
+		if err != nil {
+			logs.Error("get user nonce failed", "err", err)
+			return "", err
+		}
 	}
 	chainId, err := p.client.ChainID(p.ctx)
 	if err != nil {
@@ -50,7 +56,16 @@ func (p *PullEvent) Multisend(useraddr string, amount *big.Int) (string, error) 
 		logs.Error("send transaction failed", "err", err)
 		return "", err
 	}
-	return signedTx.Hash().String(), nil
+	//for {
+	//	_, err = p.client.TransactionReceipt(p.ctx, signedTx.Hash())
+	//	if err == ethereum.NotFound {
+	//		continue
+	//	} else {
+	//		break
+	//	}
+	//}
+	nonce++
+	return signedTx.Hash().String(), err
 }
 
 func getAddrFromPrivk(priv *ecdsa.PrivateKey) (common.Address, error) {

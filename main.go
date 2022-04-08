@@ -29,7 +29,6 @@ func main() {
 	nodeinfos := task.GetDetails()
 	amount := big.NewInt(0)
 	for _, info := range nodeinfos {
-
 		reward := task.GetRewardInfo(info)
 		d, _ := json.Marshal(reward)
 		logs.Info("reward for ", info.NodeAddress, "detail", string(d))
