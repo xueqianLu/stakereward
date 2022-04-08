@@ -3,202 +3,205 @@ package async
 import (
 	"context"
 	"fmt"
+	"githu.com/stakereward/contracts/hpblock"
+	"githu.com/stakereward/models"
 	"github.com/astaxie/beego"
+	"github.com/astaxie/beego/logs"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/prometheus/common/log"
-	"github.com/wuban/race-service/cache"
 	"math/big"
-	"strings"
 	"time"
 )
 
-const (
-	LastSyncBlockKey = "lastSyncBlock"
-)
-
 var (
-	pullTask   *PullEvent
 	bigOne     = big.NewInt(1)
 	bigTen     = big.NewInt(10)
-	bighundred = big.NewInt(100)
+	bigHundred = big.NewInt(100)
 	bigK       = big.NewInt(1000)
+	big5K      = big.NewInt(5000)
+
+	secondOneYear    = big.NewInt(60 * 60 * 24 * 365)
+	rewardOneYear, _ = new(big.Int).SetString("3000000000000000000000", 10) // 30000 * 0.1 * 10^18
+	rewardPerSecond  = new(big.Int).Div(rewardOneYear, secondOneYear)
 )
 
-type logHandler func(log types.Log) error
-
-//type ContractEvent struct {
-//	Addr common.Address
-//	Handler logHandler
-//}
+type logHandler func(log types.Log, ctx *PullEvent) error
 
 type PullEvent struct {
 	ctx             context.Context
 	client          *ethclient.Client
+	startBlock      *big.Int
+	endBlock        *big.Int
 	lastBlock       *big.Int
+	endTime         uint64
 	contractList    []common.Address
 	contractHandler map[common.Address]logHandler
+	lockContract    *hpblock.Hpblock
+	nodeInfos       map[string]*models.NodeInfo
 }
 
-func getAddress(multiAddrs string) []string {
-	addrs := strings.Split(multiAddrs, ",")
-	ret := make([]string, 0)
-	for _, addr := range addrs {
-		if len(addr) > 0 {
-			ret = append(ret, addr)
+func (this *PullEvent) GetTimeById(number *big.Int) (uint64, error) {
+	block, err := this.client.BlockByNumber(this.ctx, number)
+	if err != nil {
+		return 0, err
+	}
+	return block.Time(), nil
+}
+
+func (this *PullEvent) AddLockInfo(nodeaddr string, info *models.LockInfo) {
+	nodeinfo, exist := this.nodeInfos[nodeaddr]
+	if !exist {
+		nodeinfo = &models.NodeInfo{Details: make([]models.RecordDetail, 0), NodeAddress: nodeaddr}
+	}
+	nodeinfo.Details = append(nodeinfo.Details, models.RecordDetail{
+		LockInfo:     info,
+		WithDrawInfo: nil,
+		InDeposit:    true,
+	})
+	this.nodeInfos[nodeaddr] = nodeinfo
+}
+
+func (this *PullEvent) AddWithDrawInfo(nodeaddr string, info *models.WithDrawInfo) {
+	nodeinfo, exist := this.nodeInfos[nodeaddr]
+	if !exist {
+		logs.Error("got withdraw event but have no lock event before.")
+		return
+	} else {
+		idx := len(nodeinfo.Details) - 1
+		if nodeinfo.Details[idx].WithDrawInfo != nil {
+			logs.Error("got withdraw event but there have a withdraw info exist in latest detail")
+		} else {
+			nodeinfo.Details[idx].WithDrawInfo = info
+			nodeinfo.Details[idx].InDeposit = false
 		}
 	}
-	return ret
 }
 
-func init() {
+func getBlockNumer(name string) *big.Int {
+	number := beego.AppConfig.String(name)
+	blockNumber, _ := new(big.Int).SetString(number, 10)
+	return blockNumber
+}
+
+func NewTask() *PullEvent {
 	var err error
 	rpc := beego.AppConfig.String("url")
-	deployBlock := beego.AppConfig.String("deployedBlock")
-	fmt.Println("get rpc ", rpc)
-	pullTask = &PullEvent{contractHandler: make(map[common.Address]logHandler)}
+	if len(rpc) == 0 {
+		rpc = "https://hpbnode.com"
+	}
+	pullTask := &PullEvent{
+		contractHandler: make(map[common.Address]logHandler),
+		nodeInfos:       make(map[string]*models.NodeInfo),
+	}
 	client, err := ethclient.Dial(rpc)
 	if err != nil {
-		panic(fmt.Sprintf("ethclient dial failed, err:", err))
+		panic(fmt.Sprintf("ethClient dial failed, err:", err))
 	} else {
 		pullTask.client = client
-		lastBlock := cache.Redis.Get(LastSyncBlockKey)
-		if len(lastBlock) == 0 {
-			lastBlock = deployBlock
-		}
-		{
-			blockNumber, _ := new(big.Int).SetString(lastBlock, 10)
-			pullTask.lastBlock = blockNumber
-		}
+		pullTask.startBlock = getBlockNumer("startblock")
+		pullTask.endBlock = getBlockNumer("endblock")
+		pullTask.lastBlock = pullTask.startBlock
 	}
 	pullTask.ctx = context.Background()
 	pullTask.contractList = make([]common.Address, 0)
 	{
-		arenaAddrs := getAddress(beego.AppConfig.String("arenaContract"))
-		for _, arenaAddr := range arenaAddrs {
-			if len(arenaAddr) > 0 {
-				addr := common.HexToAddress(arenaAddr)
+		addrs := beego.AppConfig.String("lockcontract")
+		{
+			if len(addrs) > 0 {
+				addr := common.HexToAddress(addrs)
 				pullTask.contractList = append(pullTask.contractList, addr)
-				pullTask.contractHandler[addr] = HorseArenaContractHandler
-				log.Info("add contract to fillter log", "address ", arenaAddr)
-			}
-		}
-
-		arenaExtraAddrs := getAddress(beego.AppConfig.String("arenaExtraContract"))
-		for _, arenaExtraAddr := range arenaExtraAddrs {
-			if len(arenaExtraAddr) > 0 {
-				addr := common.HexToAddress(arenaExtraAddr)
-				pullTask.contractList = append(pullTask.contractList, addr)
-				pullTask.contractHandler[addr] = HorseArenaExtraHandler
-				log.Info("add contract to fillter log", "address ", arenaExtraAddr)
-			}
-		}
-
-		arenaExtra2Addrs := getAddress(beego.AppConfig.String("arenaExtra2Contract"))
-		for _, arenaExtra2Addr := range arenaExtra2Addrs {
-			if len(arenaExtra2Addr) > 0 {
-				addr := common.HexToAddress(arenaExtra2Addr)
-				pullTask.contractList = append(pullTask.contractList, addr)
-				pullTask.contractHandler[addr] = HorseArenaExtra2Handler
-				log.Info("add contract to fillter log", "address ", arenaExtra2Addr)
-			}
-		}
-
-		arenaExtra3Addrs := getAddress(beego.AppConfig.String("arenaExtra3Contract"))
-		for _, arenaExtra3Addr := range arenaExtra3Addrs {
-			if len(arenaExtra3Addr) > 0 {
-				addr := common.HexToAddress(arenaExtra3Addr)
-				pullTask.contractList = append(pullTask.contractList, addr)
-				pullTask.contractHandler[addr] = HorseArenaExtra3Handler
-				log.Info("add contract to fillter log", "address ", arenaExtra3Addr)
-			}
-		}
-
-		horseEquipAddrs := getAddress(beego.AppConfig.String("horseEquipContract"))
-		for _, horseEquipAddr := range horseEquipAddrs {
-			if len(horseEquipAddr) > 0 {
-				addr := common.HexToAddress(horseEquipAddr)
-				pullTask.contractList = append(pullTask.contractList, addr)
-				pullTask.contractHandler[addr] = HorseEquipContractHandler
-				log.Info("add contract to fillter log", "address ", horseEquipAddr)
-			}
-		}
-
-		horseRaceAddrs := getAddress(beego.AppConfig.String("horseRaceContract"))
-		for _, horseRaceAddr := range horseRaceAddrs {
-			if len(horseRaceAddr) > 0 {
-				addr := common.HexToAddress(horseRaceAddr)
-				pullTask.contractList = append(pullTask.contractList, addr)
-				pullTask.contractHandler[addr] = HorseRaceContractHandler
-				log.Info("add contract to fillter log", "address ", horseRaceAddr)
-			}
-		}
-
-		horseRaceExtraAddrs := getAddress(beego.AppConfig.String("horseRaceExtra1Contract"))
-		for _, horseRaceExtraAddr := range horseRaceExtraAddrs {
-			if len(horseRaceExtraAddr) > 0 {
-				addr := common.HexToAddress(horseRaceExtraAddr)
-				pullTask.contractList = append(pullTask.contractList, addr)
-				pullTask.contractHandler[addr] = HorseRaceExtra1Handler
-				log.Info("add contract to fillter log", "address ", horseRaceExtraAddr)
-			}
-		}
-
-		horseRaceExtra2Addrs := getAddress(beego.AppConfig.String("horseRaceExtra2Contract"))
-		for _, horseRaceExtra2Addr := range horseRaceExtra2Addrs {
-			if len(horseRaceExtra2Addr) > 0 {
-				addr := common.HexToAddress(horseRaceExtra2Addr)
-				pullTask.contractList = append(pullTask.contractList, addr)
-				pullTask.contractHandler[addr] = HorseRaceExtra2Handler
-				log.Info("add contract to fillter log", "address ", horseRaceExtra2Addr)
+				pullTask.contractHandler[addr] = HpbLockHandler
+				pullTask.lockContract, _ = hpblock.NewHpblock(addr, client)
+				pullTask.client = client
+				logs.Info("add contract to fillter log", "address ", addrs)
 			}
 		}
 	}
+	return pullTask
 }
 
-func SyncLogs() {
-	pullTask.GetLogs()
+func (p *PullEvent) GetDetails() map[string]*models.NodeInfo {
+	return p.nodeInfos
 }
 
-func (p *PullEvent) GetLogs() {
+func (p *PullEvent) GetRewardInfo(nodeinfo *models.NodeInfo) []*models.RewardInfo {
+	var err error
+	if p.endTime == 0 {
+		p.endTime, err = p.GetTimeById(p.endBlock)
+		if err != nil {
+			logs.Error("get endtime failed ", "err", err)
+			return nil
+		}
+	}
+	var reward = make([]*models.RewardInfo, 0)
+	for i := 0; i < len(nodeinfo.Details); i++ {
+		detail := nodeinfo.Details[i]
+		r := &models.RewardInfo{}
+		r.RecordDetail = &nodeinfo.Details[i]
+		r.UserAddress = r.RecordDetail.UserAddress
+		if detail.WithDrawInfo == nil {
+			r.StakeDuration = p.endTime - r.RecordDetail.LockTime
+		} else {
+			r.StakeDuration = r.RecordDetail.WithdrawTime - r.RecordDetail.LockTime
+		}
+		r.Amount = new(big.Int).Mul(rewardPerSecond, big.NewInt(int64(r.StakeDuration)))
+		reward = append(reward, r)
+	}
+	return reward
+}
+
+func (p *PullEvent) SyncLogs() {
 	query := ethereum.FilterQuery{}
 	query.FromBlock = p.lastBlock
 	query.ToBlock = new(big.Int).Add(p.lastBlock, big.NewInt(1))
 	query.Addresses = p.contractList
 	for {
+		var finish = false
 		query.FromBlock = p.lastBlock
 
-		log.Info("start fileter start at ", p.lastBlock.Text(10))
+		//logs.Info("start fileter start at ", p.lastBlock.Text(10))
 		height, err := p.client.BlockNumber(p.ctx)
+		if err != nil {
+			logs.Error("get block number failed", "err", err)
+		}
 		if height <= p.lastBlock.Uint64() {
 			time.Sleep(time.Second)
 			continue
+		} else if (height - 5000) >= p.lastBlock.Uint64() {
+			query.ToBlock = new(big.Int).Add(p.lastBlock, big5K)
 		} else if (height - 1000) >= p.lastBlock.Uint64() {
 			query.ToBlock = new(big.Int).Add(p.lastBlock, bigK)
 		} else if (height - 100) >= p.lastBlock.Uint64() {
-			query.ToBlock = new(big.Int).Add(p.lastBlock, bighundred)
+			query.ToBlock = new(big.Int).Add(p.lastBlock, bigHundred)
 		} else if (height - 10) >= p.lastBlock.Uint64() {
 			query.ToBlock = new(big.Int).Add(p.lastBlock, bigTen)
 		} else {
 			query.ToBlock = new(big.Int).Add(p.lastBlock, bigOne)
 		}
+		if query.ToBlock.Cmp(p.endBlock) > 0 {
+			query.ToBlock = p.endBlock
+			finish = true
+		}
 
 		allLogs, err := p.client.FilterLogs(p.ctx, query)
 		if err != nil {
-			log.Error("filter logs failed", err)
+			logs.Error("filter logs failed", err)
 			continue
 		}
 		if len(allLogs) > 0 {
 			for _, vlog := range allLogs {
 				handle, exist := p.contractHandler[vlog.Address]
 				if exist {
-					handle(vlog)
+					handle(vlog, p)
 				}
 			}
 		}
 		p.lastBlock = new(big.Int).Add(query.ToBlock, bigOne)
-		cache.Redis.Set(LastSyncBlockKey, p.lastBlock.Text(10))
+		if finish {
+			logs.Info("get logs finished")
+			return
+		}
 	}
 }
